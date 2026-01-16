@@ -437,7 +437,7 @@ alert('✅ 所有数据已清空！');
 }
 }
 
-async function callDeepSeek(prompt,systemPrompt=''){
+async function callDeepSeek(prompt,systemPrompt='',contextInfo=null){
 if(!settings.apiKey){
 console.log('未设置API Key，使用模拟回复');
 return generateMockResponse(prompt);
@@ -446,6 +446,15 @@ try{
 let finalSystemPrompt=systemPrompt||'你是一个友好、有思想的论坛用户，回复要自然、有人情味，不要太长，控制在100字以内。';
 if(settings.aiRules){
 finalSystemPrompt+='\n\n用户要求：'+settings.aiRules;
+}
+finalSystemPrompt+='\n\n重要规则：\n1. 你能看到帖子的所有回复，请不要发出与已有回复重复的内容\n2. 仔细查看历史评论，避免重复观点\n3. 如果话题已经被充分讨论，可以提供新的角度或补充信息';
+if(contextInfo){
+if(contextInfo.existingComments&&contextInfo.existingComments.length>0){
+finalSystemPrompt+='\n\n当前帖子已有的评论：\n'+contextInfo.existingComments.map(c=>`- ${c.author}: ${c.content}`).join('\n');
+}
+if(contextInfo.recentAIHistory&&contextInfo.recentAIHistory.length>0){
+finalSystemPrompt+='\n\n你最近的20条发言历史（避免重复）：\n'+contextInfo.recentAIHistory.map(h=>`- ${h.content.substring(0,50)}...`).join('\n');
+}
 }
 const response=await fetch('https://api.deepseek.com/v1/chat/completions',{
 method:'POST',
@@ -567,8 +576,13 @@ targetPost.likes++;
 console.log('AI点赞了帖子');
 }else{
 const persona=aiPersonas[Math.floor(Math.random()*aiPersonas.length)];
+const recentAIHistory=getRecentAIHistory(20);
+const contextInfo={
+existingComments:targetPost.comments,
+recentAIHistory:recentAIHistory
+};
 const prompt=`针对这个帖子："${targetPost.content}"，写一条简短、自然的评论，要像真人评论一样。控制在50字以内。`;
-const commentContent=await callDeepSeek(prompt);
+const commentContent=await callDeepSeek(prompt,'',contextInfo);
 targetPost.comments.push({
 id:Date.now(),
 author:persona.name,
@@ -846,7 +860,7 @@ saveData();
 renderPosts();
 }
 
-function addComment(postId,content){
+async function addComment(postId,content){
 if(!content||!content.trim())return;
 const post=posts.find(p=>p.id===postId);
 if(!post)return;
@@ -865,6 +879,13 @@ userProfile.lastInteractions[postId]=Date.now();
 saveData();
 renderPosts();
 updateUserInterests(content);
+const lastComment=post.comments[post.comments.length-2];
+if(lastComment&&lastComment.isAI){
+console.log('检测到用户回复了AI评论，AI将立即回复');
+setTimeout(async()=>{
+await aiReplyToUser(post,comment);
+},Math.random()*3000+2000);
+}
 }
 
 function replyToComment(postId,commentId,replyToAuthor){
@@ -879,7 +900,7 @@ input.focus();
 input.dataset.replyTo=commentId;
 input.dataset.replyToAuthor=replyToAuthor;
 const oldHandler=input.onkeypress;
-input.onkeypress=function(e){
+input.onkeypress=async function(e){
 if(e.key==='Enter'){
 const content=this.value.trim();
 if(!content)return;
@@ -902,6 +923,12 @@ this.placeholder='写下你的评论...';
 delete this.dataset.replyTo;
 delete this.dataset.replyToAuthor;
 this.onkeypress=oldHandler;
+if(comment.isAI){
+console.log('用户回复了AI评论，AI将立即回复');
+setTimeout(async()=>{
+await aiReplyToUserInThread(post,comment,content);
+},Math.random()*3000+2000);
+}
 }
 };
 }
@@ -1032,6 +1059,82 @@ ${topic.description||'暂无描述'} · ${topic.postCount}条帖子 · ${formatT
 </div>
 </div>
 `).join('');
+}
+
+function getRecentAIHistory(limit=20){
+const aiContents=[];
+for(let i=0;i<posts.length&&aiContents.length<limit;i++){
+const post=posts[i];
+if(post.isAI){
+aiContents.push({type:'post',content:post.content,timestamp:post.timestamp});
+}
+post.comments.forEach(comment=>{
+if(comment.isAI&&aiContents.length<limit){
+aiContents.push({type:'comment',content:comment.content,timestamp:comment.timestamp});
+}
+if(comment.replies){
+comment.replies.forEach(reply=>{
+if(reply.isAI&&aiContents.length<limit){
+aiContents.push({type:'reply',content:reply.content,timestamp:reply.timestamp});
+}
+});
+}
+});
+}
+return aiContents.sort((a,b)=>b.timestamp-a.timestamp).slice(0,limit);
+}
+
+async function aiReplyToUser(post,userComment){
+const persona=aiPersonas[Math.floor(Math.random()*aiPersonas.length)];
+const recentAIHistory=getRecentAIHistory(20);
+const contextInfo={
+existingComments:post.comments,
+recentAIHistory:recentAIHistory,
+postContent:post.content
+};
+const prompt=`用户刚刚评论了："${userComment.content}"，这是在帖子"${post.content}"下的评论。请写一条自然、友好的回复，像真人对话一样。控制在50字以内。`;
+const replyContent=await callDeepSeek(prompt,'你是一个友好的论坛用户，正在与其他用户互动。回复要自然、有人情味，不要太正式。',contextInfo);
+const aiReply={
+id:Date.now(),
+author:persona.name,
+avatar:persona.avatar,
+content:replyContent,
+isAI:true,
+timestamp:Date.now(),
+replies:[]
+};
+post.comments.push(aiReply);
+userProfile.lastInteractions[post.id]=Date.now();
+saveData();
+renderPosts();
+console.log('AI回复了用户评论:',persona.name);
+}
+
+async function aiReplyToUserInThread(post,originalComment,userReplyContent){
+const persona=aiPersonas[Math.floor(Math.random()*aiPersonas.length)];
+const recentAIHistory=getRecentAIHistory(20);
+const contextInfo={
+existingComments:post.comments,
+recentAIHistory:recentAIHistory,
+postContent:post.content,
+originalComment:originalComment.content
+};
+const prompt=`用户回复了你的评论"${originalComment.content}"，说："${userReplyContent}"。请写一条自然、友好的回复。控制在50字以内。`;
+const replyContent=await callDeepSeek(prompt,'你是一个友好的论坛用户，正在与其他用户进行对话。回复要自然、有人情味。',contextInfo);
+if(!originalComment.replies)originalComment.replies=[];
+originalComment.replies.push({
+id:Date.now(),
+author:persona.name,
+avatar:persona.avatar,
+content:replyContent,
+isAI:true,
+timestamp:Date.now(),
+replyTo:settings.username
+});
+userProfile.lastInteractions[post.id]=Date.now();
+saveData();
+renderPosts();
+console.log('AI在评论串中回复了用户:',persona.name);
 }
 
 window.onload=init;
